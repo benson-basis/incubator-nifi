@@ -142,6 +142,10 @@
             <scope>test</scope>
         </dependency>
         <dependency>
+        	<groupId>org.apache.nifi</groupId>
+        	<artifactId>http-context-map-api</artifactId>
+        </dependency>
+        <dependency>
             <groupId>joda-time</groupId>
             <artifactId>joda-time</artifactId>
         </dependency>
