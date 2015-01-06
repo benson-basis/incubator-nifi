@@ -67,8 +67,9 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
 
 import com.sun.jersey.api.client.ClientResponse.Status;
 
-public class ReceiveHTTPRequest extends AbstractProcessor {
-
+public class HandleHttpRequest extends AbstractProcessor {
+    public static final String HTTP_CONTEXT_ID = "http.context.identifier";
+    
     // Allowable values for client auth
     public static final AllowableValue CLIENT_NONE = new AllowableValue("No Authentication", "Processor will not authenticate clients. Anyone can communicate with this Processor anonymously");
     public static final AllowableValue CLIENT_WANT = new AllowableValue("Want Authentication", "Processor will try to verify the client but if unable to verify will allow the client to communicate anonymously");
@@ -79,7 +80,7 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
         .name("Listening Port")
         .description("The Port to listen on for incoming HTTP requests")
         .required(true)
-        .addValidator(StandardValidators.PORT_VALIDATOR)
+        .addValidator(StandardValidators.createLongValidator(0L, 65535L, true))
         .expressionLanguageSupported(false)
         .defaultValue("80")
         .build();
@@ -181,6 +182,7 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
         descriptors.add(PORT);
         descriptors.add(HOSTNAME);
         descriptors.add(SSL_CONTEXT);
+        descriptors.add(HTTP_CONTEXT_MAP);
         descriptors.add(PATH_REGEX);
         descriptors.add(ALLOW_GET);
         descriptors.add(ALLOW_POST);
@@ -296,12 +298,14 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
             public void handle(final String target, final Request baseRequest, final HttpServletRequest request, 
                         final HttpServletResponse response) throws IOException, ServletException {
                 
+                final String requestUri = request.getRequestURI();
                 if ( !allowedMethods.contains(request.getMethod().toUpperCase()) ) {
+                    getLogger().info("Sending back METHOD_NOT_ALLOWED response to {}; method was {}; request URI was {}", 
+                            new Object[] {request.getRemoteAddr(), request.getMethod(), requestUri});
                     response.sendError(Status.METHOD_NOT_ALLOWED.getStatusCode());
                     return;
                 }
                 
-                final String requestUri = request.getRequestURI();
                 if ( pathPattern != null ) {
                     final URI uri;
                     try {
@@ -312,6 +316,8 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
                     
                     if ( !pathPattern.matcher(uri.getPath()).matches() ) {
                         response.sendError(Status.NOT_FOUND.getStatusCode());
+                        getLogger().info("Sending back NOT_FOUND response to {}; request was {} {}", 
+                                new Object[] {request.getRemoteAddr(), request.getMethod(), requestUri});
                         return;
                     }
                 }
@@ -321,7 +327,13 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
                 // so it is not known to us. Should see if it can be added to the ProcessContext.
                 final AsyncContext async = baseRequest.startAsync();
                 final boolean added = containerQueue.offer(new HttpRequestContainer(request, response, async));
-                if ( !added ) {
+                
+                if ( added ) {
+                    getLogger().debug("Added Http Request to queue for {} {} from {}", new Object[] {request.getMethod(), requestUri, request.getRemoteAddr()});
+                } else {
+                    getLogger().info("Sending back a SERVICE_UNAVAILABLE response to {}; request was {} {}", 
+                            new Object[] {request.getRemoteAddr(), request.getMethod(), request.getRemoteAddr()});
+
                     response.sendError(Status.SERVICE_UNAVAILABLE.getStatusCode());
                     response.flushBuffer();
                     async.complete();
@@ -331,6 +343,22 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
         
         this.server = server;
         server.start();
+        
+        getLogger().info("Server started and listening on port " + getPort());
+    }
+    
+    protected int getPort() {
+        for ( final Connector connector : server.getConnectors() ) {
+            if ( connector instanceof ServerConnector ) {
+                return ((ServerConnector) connector).getPort();
+            }
+        }
+        
+        throw new IllegalStateException("Server is not listening on any ports");
+    }
+    
+    protected int getRequestQueueSize() {
+        return containerQueue.size();
     }
     
     private SslContextFactory createSslFactory(final SSLContextService sslService, final boolean needClientAuth, final boolean wantClientAuth) {
@@ -357,7 +385,10 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
     @OnStopped
     public void shutdown() throws Exception {
         if ( server != null ) {
+            getLogger().debug("Shutting down server");
             server.stop();
+            server.join();
+            getLogger().info("Shut down {}", new Object[] {server});
         }
     }
     
@@ -381,14 +412,14 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
         
         final String contextIdentifier = UUID.randomUUID().toString();
         final Map<String, String> attributes = new HashMap<>();
-        putAttribute(attributes, "http.context.identifier", contextIdentifier);
+        putAttribute(attributes, HTTP_CONTEXT_ID, contextIdentifier);
         putAttribute(attributes, "mime.type", request.getContentType());
         putAttribute(attributes, "http.servlet.path", request.getServletPath());
         putAttribute(attributes, "http.context.path", request.getContextPath());
         putAttribute(attributes, "http.method", request.getMethod());
-        putAttribute(attributes, "http.query", request.getQueryString());
+        putAttribute(attributes, "http.query.string", request.getQueryString());
         putAttribute(attributes, "http.remote.host", request.getRemoteHost());
-        putAttribute(attributes, "http.remote.address", request.getRemoteAddr());
+        putAttribute(attributes, "http.remote.addr", request.getRemoteAddr());
         putAttribute(attributes, "http.remote.user", request.getRemoteUser());
         putAttribute(attributes, "http.request.uri", request.getRequestURI());
         putAttribute(attributes, "http.auth.type", request.getAuthType());
@@ -419,6 +450,7 @@ public class ReceiveHTTPRequest extends AbstractProcessor {
         final long receiveMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
         session.getProvenanceReporter().receive(flowFile, request.getRequestURI(), receiveMillis);
         session.transfer(flowFile, REL_SUCCESS);
+        getLogger().info("Transferring {} to 'success'; received from {}", new Object[] {flowFile, request.getRemoteAddr()});
         
         final HttpContextMap contextMap = context.getProperty(HTTP_CONTEXT_MAP).asControllerService(HttpContextMap.class);
         contextMap.register(contextIdentifier, request, container.getResponse(), container.getContext());
